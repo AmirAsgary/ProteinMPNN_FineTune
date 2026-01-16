@@ -3,3 +3,4 @@ test/
 output/
 log*
 *log*
+tmp*

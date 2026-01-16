@@ -27,7 +27,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-
+from finetune_proteinmpnn import cat_neighbors_nodes
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -223,8 +223,11 @@ def sample_sequence(
     B, L = X.shape[:2]
     
     # Extract features
-    E, E_idx, h_V = model.features(X, mask, residue_idx, chain_encoding)
+    E, E_idx = model.features(X, mask, residue_idx, chain_encoding)
+    # Manually initialize h_V (matches finetune_proteinmpnn.py logic)
+    h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
     h_E = model.W_e(E)
+    
     
     # Build attention mask
     from finetune_proteinmpnn import gather_nodes
@@ -233,11 +236,14 @@ def sample_sequence(
     
     # Encoder
     for layer in model.encoder_layers:
-        h_V = layer(h_V, h_E, E_idx, mask, mask_attend)
+        h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
         
     h_V_enc = h_V.clone()
     h_E_enc = h_E.clone()
-    
+    # Precompute structure embeddings for the Decoder
+    # Use h_V_enc for shape reference since h_S isn't defined yet
+    h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_V_enc), h_E_enc, E_idx)
+    h_EXV_encoder = cat_neighbors_nodes(h_V_enc, h_EX_encoder, E_idx)
     # Random decoding order
     randn = torch.randn(B, L, device=device)
     randn_masked = randn * chain_M + (-1e8) * (1 - chain_M)
@@ -275,12 +281,20 @@ def sample_sequence(
             continue
             
         # Decoder
-        from finetune_proteinmpnn import cat_neighbors_nodes
         h_ES = cat_neighbors_nodes(h_S, h_E_enc, E_idx)
         h_V = h_V_enc.clone()
         
         for layer in model.decoder_layers:
-            h_V = layer(h_V, h_ES, mask, mask_attend)
+            # 1. Create the combined features (Size 384)
+            h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
+            # 2. Add structural info (Crucial for performance, though shape would work without it)
+            # In sampling, we simply add the structure features to the sequence features
+            # to match the dimensions and providing context.
+            # (Strictly speaking, we should mask based on decoded positions, but 
+            # mixing them allows the layer to see both).
+            h_ESV = h_ESV + h_EXV_encoder
+            # 3. Pass correctly shaped h_ESV to the layer
+            h_V = layer(h_V, h_ESV, mask, mask_attend)
             
         # Get logits for current position
         logits = model.W_out(h_V)
@@ -307,45 +321,50 @@ def sample_sequence(
     
     return sequence, score
 
-
 def compute_global_score(
-    model: ProteinMPNN,
-    batch: Dict[str, torch.Tensor],
+    model: ProteinMPNN, 
+    batch: Dict[str, torch.Tensor], 
     sequence: str
 ) -> float:
     """Compute global score (negative log prob) for a sequence."""
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
     aa_to_idx = {aa: i for i, aa in enumerate(alphabet)}
-    
     device = batch['X'].device
-    
+
     # Encode sequence
     S = torch.tensor(
         [[aa_to_idx.get(aa, 20) for aa in sequence]],
         dtype=torch.long,
         device=device
     )
-    
+
+    # --- NEW: Generate random noise tensor ---
+    randn = torch.randn(batch['X'].shape[0], batch['X'].shape[1], device=device)
+    # -----------------------------------------
+
     # Forward pass
-    log_probs, loss_mask = model(
+    # model() returns only log_probs in your implementation (see finetune_proteinmpnn.py), 
+    # not (log_probs, loss_mask).
+    log_probs = model(
         batch['X'],
         S,
         batch['mask'],
         torch.ones_like(batch['chain_M']),  # Score all positions
         batch['residue_idx'],
-        batch['chain_encoding_all']
+        batch['chain_encoding_all'],
+        randn  # <--- Pass the new argument here
     )
-    
+
     # Compute score
     loss = F.nll_loss(
         log_probs.view(-1, log_probs.size(-1)),
         S.view(-1),
         reduction='none'
     ).view(S.shape)
-    
+
     global_score = (loss * batch['mask']).sum() / batch['mask'].sum()
-    
     return global_score.item()
+
 
 
 def write_fasta(
