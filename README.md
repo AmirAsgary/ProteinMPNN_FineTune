@@ -1,6 +1,6 @@
 # ProteinMPNN Fine-tuning Framework
 
-A comprehensive framework for fine-tuning ProteinMPNN on your own protein structure data with full control over training, fixed positions/chains, and monitoring.
+A framework for fine-tuning ProteinMPNN on your own protein structure data with full control over training, fixed positions/chains, and monitoring.
 
 ## Features
 
