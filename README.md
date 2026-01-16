@@ -326,32 +326,6 @@ python sample_sequences.py \
     --num_samples 100
 ```
 
-## Tips for Fine-tuning
-
-1. **Start with lower learning rate**: Use 1e-5 to 1e-4 for fine-tuning
-2. **Match backbone noise**: Use the same noise level as the pretrained model (0.20Å for v_48_020)
-3. **Monitor validation loss**: Watch for overfitting, especially with small datasets
-4. **Data quality**: Ensure PDB files have good resolution and complete backbone atoms
-5. **Batch size**: Reduce if running out of GPU memory
-6. **Fixed positions**: Training with fixed positions teaches the model to focus on designable regions
-
-## Troubleshooting
-
-### Out of Memory
-- Reduce `batch_size`
-- Enable `use_amp: true` (mixed precision)
-- Reduce `max_length` for proteins
-
-### Poor Performance
-- Check that pretrained weights loaded correctly
-- Ensure data format is correct
-- Try different learning rates
-- Increase training epochs
-
-### NaN Loss
-- Reduce learning rate
-- Check for corrupted PDB files
-- Enable gradient clipping (default: 1.0)
 
 ## Citation
 
