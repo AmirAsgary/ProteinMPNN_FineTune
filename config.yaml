@@ -1,0 +1,51 @@
+# ProteinMPNN Fine-tuning Configuration
+# =====================================
+
+# Data paths
+data_dir: "./data/train"          # Directory with PDB files or JSON data
+val_data_dir: "./data/val"        # Validation data (optional)
+fixed_positions_json: null        # JSON file for fixed positions (optional)
+
+# Model architecture
+hidden_dim: 128                   # Hidden dimension (default: 128)
+num_encoder_layers: 3             # Number of encoder layers
+num_decoder_layers: 3             # Number of decoder layers
+k_neighbors: 48                   # Number of neighbors in graph
+dropout: 0.1                      # Dropout rate
+backbone_noise: 0.1               # Backbone coordinate noise (Angstroms)
+
+# Pre-trained checkpoint
+# Download from: https://github.com/dauparas/ProteinMPNN
+# Options: v_48_002.pt, v_48_010.pt, v_48_020.pt, v_48_030.pt
+checkpoint: "./pretrained/v_48_020.pt"
+
+# Training parameters
+output_dir: "./outputs/my_finetune"
+epochs: 100
+batch_size: 8                     # Reduce if OOM
+lr: 1e-4                          # Learning rate (1e-4 to 1e-5 recommended for fine-tuning)
+weight_decay: 0.01
+warmup_steps: 1000
+grad_clip: 1.0
+scheduler: "cosine"               # Options: cosine, onecycle, plateau, none
+
+# Mixed precision (faster training, less memory)
+use_amp: true
+
+# Monitoring
+use_wandb: false                  # Set to true to use Weights & Biases
+wandb_project: "proteinmpnn-finetune"
+wandb_name: null                  # Auto-generated if null
+log_interval: 10                  # Log every N steps
+eval_interval: 1                  # Evaluate every N epochs
+save_interval: 5                  # Save checkpoint every N epochs
+
+# Data loading
+num_workers: 4
+max_length: 2000                  # Max sequence length
+
+# Reproducibility
+seed: 42
+
+# Resume training
+resume: null                      # Path to checkpoint to resume from

@@ -1,0 +1,16 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.21.0
+pyyaml>=5.4.0
+tqdm>=4.62.0
+
+# Optional - monitoring
+tensorboard>=2.10.0
+wandb>=0.13.0
+
+# Optional - better PDB parsing
+biopython>=1.79
+
+# Optional - for notebooks
+jupyter>=1.0.0
+matplotlib>=3.5.0

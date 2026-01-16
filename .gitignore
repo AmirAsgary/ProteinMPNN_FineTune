@@ -1,0 +1,5 @@
+pretrained/
+test/
+output/
+log*
+*log*
