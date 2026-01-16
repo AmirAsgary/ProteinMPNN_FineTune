@@ -6,12 +6,20 @@ This version exactly matches the original ProteinMPNN architecture to ensure
 compatibility with pretrained weights.
 
 Usage:
+    # Training
     python finetune_proteinmpnn.py \
         --data_dir ./my_pdbs \
         --checkpoint ./pretrained/v_48_020.pt \
         --output_dir ./finetuned_model \
         --epochs 50 \
         --lr 1e-4
+
+    # Testing
+    python finetune_proteinmpnn.py \
+        --test \
+        --test_data_dir ./test_pdbs \
+        --checkpoint ./finetuned_model/checkpoints/checkpoint_best.pt \
+        --output_dir ./test_results
 """
 
 import os
@@ -929,6 +937,149 @@ class Trainer:
 
 
 # ==============================================================================
+# TESTING
+# ==============================================================================
+
+@torch.no_grad()
+def run_test(model, test_dataset, config, output_dir, device):
+    """Run evaluation on test set and save detailed results"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger = setup_logging(str(output_dir))
+    logger.info(f"Running test evaluation on {len(test_dataset)} structures")
+    
+    batch_size = config.get('batch_size', 8)
+    num_workers = config.get('num_workers', 4)
+    
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=collate_fn, pin_memory=True
+    )
+    
+    model.eval()
+    
+    # Aggregate metrics
+    total_loss = 0
+    total_tokens = 0
+    total_correct = 0
+    
+    # Per-protein metrics
+    per_protein_results = []
+    
+    alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
+    
+    for batch_idx, batch in enumerate(test_loader):
+        X = batch['X'].to(device)
+        S = batch['S'].to(device)
+        mask = batch['mask'].to(device)
+        chain_M = batch['chain_M'].to(device)
+        residue_idx = batch['residue_idx'].to(device)
+        chain_encoding = batch['chain_encoding_all'].to(device)
+        names = batch['names']
+        
+        randn = torch.randn(X.shape[0], X.shape[1], device=device)
+        
+        log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding, randn)
+        
+        loss_mask = chain_M * mask
+        loss_per_pos, _ = loss_nll(S, log_probs, loss_mask)
+        
+        predictions = log_probs.argmax(dim=-1)
+        correct_per_pos = (predictions == S).float() * loss_mask
+        
+        # Aggregate
+        batch_loss = (loss_per_pos * loss_mask).sum().item()
+        batch_tokens = loss_mask.sum().item()
+        batch_correct = correct_per_pos.sum().item()
+        
+        total_loss += batch_loss
+        total_tokens += batch_tokens
+        total_correct += batch_correct
+        
+        # Per-protein results
+        for i in range(X.shape[0]):
+            protein_mask = loss_mask[i]
+            protein_tokens = protein_mask.sum().item()
+            
+            if protein_tokens > 0:
+                protein_loss = (loss_per_pos[i] * protein_mask).sum().item() / protein_tokens
+                protein_correct = correct_per_pos[i].sum().item()
+                protein_acc = protein_correct / protein_tokens
+                protein_ppl = np.exp(protein_loss)
+                
+                # Get predicted and true sequences (only for designable positions)
+                pred_seq = ''.join([alphabet[idx] for idx, m in zip(predictions[i].cpu().numpy(), protein_mask.cpu().numpy()) if m > 0])
+                true_seq = ''.join([alphabet[idx] for idx, m in zip(S[i].cpu().numpy(), protein_mask.cpu().numpy()) if m > 0])
+                
+                per_protein_results.append({
+                    'name': names[i],
+                    'length': int(protein_tokens),
+                    'loss': protein_loss,
+                    'accuracy': protein_acc,
+                    'perplexity': protein_ppl,
+                    'correct_residues': int(protein_correct),
+                    'true_sequence': true_seq,
+                    'predicted_sequence': pred_seq
+                })
+        
+        if (batch_idx + 1) % 10 == 0:
+            logger.info(f"Processed {batch_idx + 1}/{len(test_loader)} batches")
+    
+    # Calculate aggregate metrics
+    avg_loss = total_loss / max(total_tokens, 1)
+    avg_accuracy = total_correct / max(total_tokens, 1)
+    avg_perplexity = np.exp(avg_loss)
+    
+    # Summary statistics
+    results_summary = {
+        'aggregate': {
+            'total_proteins': len(per_protein_results),
+            'total_residues': int(total_tokens),
+            'total_correct': int(total_correct),
+            'avg_loss': avg_loss,
+            'avg_accuracy': avg_accuracy,
+            'avg_perplexity': avg_perplexity
+        },
+        'per_protein': per_protein_results
+    }
+    
+    # Log summary
+    logger.info("=" * 60)
+    logger.info("TEST RESULTS SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Total proteins:    {len(per_protein_results)}")
+    logger.info(f"Total residues:    {int(total_tokens)}")
+    logger.info(f"Average Loss:      {avg_loss:.4f}")
+    logger.info(f"Average Accuracy:  {avg_accuracy:.4f} ({avg_accuracy*100:.2f}%)")
+    logger.info(f"Average Perplexity: {avg_perplexity:.4f}")
+    logger.info("=" * 60)
+    
+    # Per-protein accuracy distribution
+    if per_protein_results:
+        accuracies = [r['accuracy'] for r in per_protein_results]
+        logger.info(f"Per-protein accuracy - Min: {min(accuracies):.4f}, Max: {max(accuracies):.4f}, "
+                   f"Median: {np.median(accuracies):.4f}")
+    
+    # Save results
+    results_file = output_dir / "test_results.json"
+    with open(results_file, 'w') as f:
+        json.dump(results_summary, f, indent=2)
+    logger.info(f"Detailed results saved to {results_file}")
+    
+    # Save CSV summary for easy analysis
+    csv_file = output_dir / "test_results_per_protein.csv"
+    with open(csv_file, 'w') as f:
+        f.write("name,length,loss,accuracy,perplexity,correct_residues\n")
+        for r in per_protein_results:
+            f.write(f"{r['name']},{r['length']},{r['loss']:.6f},{r['accuracy']:.6f},"
+                   f"{r['perplexity']:.6f},{r['correct_residues']}\n")
+    logger.info(f"CSV summary saved to {csv_file}")
+    
+    return results_summary
+
+
+# ==============================================================================
 # MAIN
 # ==============================================================================
 
@@ -958,21 +1109,34 @@ def load_pretrained_weights(model, checkpoint_path, strict=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune ProteinMPNN")
+    parser = argparse.ArgumentParser(description="Fine-tune or Test ProteinMPNN")
     
-    parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--val_data_dir", type=str, default=None)
-    parser.add_argument("--fixed_positions_json", type=str, default=None)
-    parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--output_dir", type=str, default="./outputs")
+    # Data arguments
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Training data directory (required unless --test is used)")
+    parser.add_argument("--val_data_dir", type=str, default=None,
+                        help="Validation data directory")
+    parser.add_argument("--test_data_dir", type=str, default=None,
+                        help="Test data directory for evaluation")
+    parser.add_argument("--test", action="store_true",
+                        help="Run evaluation on test set instead of training")
+    parser.add_argument("--fixed_positions_json", type=str, default=None,
+                        help="JSON file specifying fixed chains/positions")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Pretrained checkpoint path (required for --test)")
+    parser.add_argument("--output_dir", type=str, default="./outputs",
+                        help="Output directory for results/checkpoints")
     
+    # Model arguments
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_encoder_layers", type=int, default=3)
     parser.add_argument("--num_decoder_layers", type=int, default=3)
     parser.add_argument("--k_neighbors", type=int, default=48)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--backbone_noise", type=float, default=0.0)
+    parser.add_argument("--backbone_noise", type=float, default=0.0,
+                        help="Noise added to backbone coordinates (disabled during test)")
     
+    # Training arguments
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -980,14 +1144,26 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--label_smoothing", type=float, default=0.0)
     
+    # Other arguments
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=5)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume training from checkpoint")
     
     args = parser.parse_args()
+    
+    # Validate arguments
+    if args.test:
+        if not args.test_data_dir:
+            parser.error("--test_data_dir is required when using --test")
+        if not args.checkpoint:
+            parser.error("--checkpoint is required when using --test")
+    else:
+        if not args.data_dir:
+            parser.error("--data_dir is required for training")
     
     # Set seed
     random.seed(args.seed)
@@ -1009,18 +1185,7 @@ def main():
                 fixed_chains[name] = settings['fixed_chains']
             if 'fixed_positions' in settings:
                 fixed_positions[name] = settings['fixed_positions']
-                
-    # Datasets
-    train_dataset = ProteinDataset(
-        args.data_dir, fixed_chains_dict=fixed_chains, fixed_positions_dict=fixed_positions
-    )
     
-    val_dataset = None
-    if args.val_data_dir:
-        val_dataset = ProteinDataset(
-            args.val_data_dir, fixed_chains_dict=fixed_chains, fixed_positions_dict=fixed_positions
-        )
-        
     # Model
     model = ProteinMPNN(
         num_letters=21,
@@ -1030,11 +1195,11 @@ def main():
         num_encoder_layers=args.num_encoder_layers,
         num_decoder_layers=args.num_decoder_layers,
         k_neighbors=args.k_neighbors,
-        augment_eps=args.backbone_noise,
-        dropout=args.dropout
+        augment_eps=0.0 if args.test else args.backbone_noise,  # No noise during test
+        dropout=args.dropout if not args.test else 0.0  # No dropout during test
     )
     
-    # Load pretrained weights
+    # Load checkpoint
     if args.checkpoint:
         load_pretrained_weights(model, args.checkpoint, strict=False)
         
@@ -1043,24 +1208,68 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {num_params:,}")
     
-    # Training config
+    # Config for data loading
     config = {
         'batch_size': args.batch_size,
-        'num_epochs': args.epochs,
-        'lr': args.lr,
-        'weight_decay': args.weight_decay,
-        'grad_clip': args.grad_clip,
-        'label_smoothing': args.label_smoothing,
-        'log_interval': args.log_interval,
-        'eval_interval': args.eval_interval,
-        'save_interval': args.save_interval,
         'num_workers': args.num_workers,
         'k_neighbors': args.k_neighbors,
-        'use_amp': True
     }
     
-    trainer = Trainer(model, train_dataset, val_dataset, config, args.output_dir, device)
-    trainer.train(resume_from=args.resume)
+    if args.test:
+        # ===================== TEST MODE =====================
+        print("\n" + "=" * 60)
+        print("RUNNING IN TEST MODE")
+        print("=" * 60 + "\n")
+        
+        test_dataset = ProteinDataset(
+            args.test_data_dir,
+            fixed_chains_dict=fixed_chains,
+            fixed_positions_dict=fixed_positions
+        )
+        
+        results = run_test(model, test_dataset, config, args.output_dir, device)
+        
+        print("\n" + "=" * 60)
+        print("TEST COMPLETE")
+        print(f"Results saved to: {args.output_dir}")
+        print("=" * 60)
+        
+    else:
+        # ===================== TRAINING MODE =====================
+        print("\n" + "=" * 60)
+        print("RUNNING IN TRAINING MODE")
+        print("=" * 60 + "\n")
+        
+        # Datasets
+        train_dataset = ProteinDataset(
+            args.data_dir,
+            fixed_chains_dict=fixed_chains,
+            fixed_positions_dict=fixed_positions
+        )
+        
+        val_dataset = None
+        if args.val_data_dir:
+            val_dataset = ProteinDataset(
+                args.val_data_dir,
+                fixed_chains_dict=fixed_chains,
+                fixed_positions_dict=fixed_positions
+            )
+        
+        # Training config
+        config.update({
+            'num_epochs': args.epochs,
+            'lr': args.lr,
+            'weight_decay': args.weight_decay,
+            'grad_clip': args.grad_clip,
+            'label_smoothing': args.label_smoothing,
+            'log_interval': args.log_interval,
+            'eval_interval': args.eval_interval,
+            'save_interval': args.save_interval,
+            'use_amp': True
+        })
+        
+        trainer = Trainer(model, train_dataset, val_dataset, config, args.output_dir, device)
+        trainer.train(resume_from=args.resume)
 
 
 if __name__ == "__main__":
