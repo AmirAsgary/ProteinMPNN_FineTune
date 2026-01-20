@@ -6,6 +6,10 @@ A framework for fine-tuning ProteinMPNN on your own protein structure data with 
 
 - **Custom Data Support**: Load PDB files or JSON/JSONL formatted data
 - **Fixed Positions/Chains**: Specify which residues or chains should remain fixed during training and inference
+- **Advanced Fine-tuning Techniques**:
+  - **LoRA (Low-Rank Adaptation)**: Reduce trainable parameters by 90%+ while preventing overfitting
+  - **Layer Freezing**: Freeze encoder/decoder layers to preserve pretrained representations
+  - **EWC (Elastic Weight Consolidation)**: Prevent catastrophic forgetting with regularization
 - **Training Monitoring**: TensorBoard and Weights & Biases integration
 - **Flexible Configuration**: YAML config files or command-line arguments
 - **Mixed Precision Training**: Faster training with automatic mixed precision (AMP)
@@ -115,6 +119,23 @@ python finetune_proteinmpnn.py \
     --batch_size 8
 ```
 
+Using LoRA for parameter-efficient fine-tuning (recommended):
+
+```bash
+python finetune_proteinmpnn.py \
+    --data_dir ./prepared_data/train \
+    --val_data_dir ./prepared_data/val \
+    --checkpoint ./pretrained/v_48_020.pt \
+    --output_dir ./outputs/my_lora_model \
+    --use_lora \
+    --lora_rank 8 \
+    --lora_alpha 16 \
+    --freeze_encoder_layers 2 \
+    --epochs 50 \
+    --lr 1e-4 \
+    --batch_size 8
+```
+
 Using a config file:
 
 ```bash
@@ -130,6 +151,91 @@ python sample_sequences.py \
     --output_dir ./designed_sequences \
     --num_samples 100 \
     --temperature 0.1
+```
+
+## Advanced Fine-tuning Techniques
+
+### LoRA (Low-Rank Adaptation)
+
+LoRA adds trainable low-rank matrices to frozen linear layers, dramatically reducing trainable parameters while preventing large deviations from pretrained weights.
+
+```bash
+python finetune_proteinmpnn.py \
+    --data_dir ./prepared_data/train \
+    --val_data_dir ./prepared_data/val \
+    --checkpoint ./pretrained/v_48_020.pt \
+    --output_dir ./outputs/lora_model \
+    --use_lora \
+    --lora_rank 8 \
+    --lora_alpha 16 \
+    --epochs 50 \
+    --lr 1e-4
+```
+
+**LoRA Parameters:**
+- `--lora_rank`: Rank of LoRA matrices (4-16, default: 8). Lower = more constrained
+- `--lora_alpha`: LoRA scaling parameter (default: 16). Usually 1-2x the rank
+
+### Layer Freezing
+
+Freeze early encoder/decoder layers to preserve pretrained representations:
+
+```bash
+python finetune_proteinmpnn.py \
+    --data_dir ./prepared_data/train \
+    --val_data_dir ./prepared_data/val \
+    --checkpoint ./pretrained/v_48_020.pt \
+    --output_dir ./outputs/frozen_model \
+    --freeze_encoder_layers 2 \
+    --freeze_decoder_layers 1 \
+    --epochs 50 \
+    --lr 1e-4
+```
+
+**Recommendations:**
+- Freeze 2/3 encoder layers for good balance
+- Freeze all encoder layers for maximum preservation
+- ProteinMPNN has 3 encoder + 3 decoder layers by default
+
+### Elastic Weight Consolidation (EWC)
+
+EWC computes Fisher Information Matrix to identify important weights and adds regularization to protect them during fine-tuning:
+
+```bash
+python finetune_proteinmpnn.py \
+    --data_dir ./prepared_data/train \
+    --val_data_dir ./prepared_data/val \
+    --checkpoint ./pretrained/v_48_020.pt \
+    --output_dir ./outputs/ewc_model \
+    --use_ewc \
+    --ewc_lambda 1000.0 \
+    --ewc_sample_size 200 \
+    --epochs 50 \
+    --lr 1e-5
+```
+
+**EWC Parameters:**
+- `--ewc_lambda`: Regularization strength (1000-5000, default: 1000)
+- `--ewc_sample_size`: Samples for Fisher computation (default: 200)
+
+### Combining Techniques
+
+For maximum prevention of catastrophic forgetting:
+
+```bash
+python finetune_proteinmpnn.py \
+    --data_dir ./prepared_data/train \
+    --val_data_dir ./prepared_data/val \
+    --checkpoint ./pretrained/v_48_020.pt \
+    --output_dir ./outputs/combined_model \
+    --use_lora \
+    --lora_rank 8 \
+    --lora_alpha 16 \
+    --freeze_encoder_layers 2 \
+    --use_ewc \
+    --ewc_lambda 500.0 \
+    --epochs 50 \
+    --lr 1e-5
 ```
 
 ## Fixed Positions and Chains
@@ -218,6 +324,16 @@ backbone_noise: 0.1
 # Pretrained checkpoint
 checkpoint: "./pretrained/v_48_020.pt"
 
+# Advanced Fine-tuning
+use_lora: false
+lora_rank: 8
+lora_alpha: 16
+freeze_encoder_layers: 0
+freeze_decoder_layers: 0
+use_ewc: false
+ewc_lambda: 1000.0
+ewc_sample_size: 200
+
 # Training
 output_dir: "./outputs/my_model"
 epochs: 100
@@ -252,6 +368,9 @@ seed: 42
 | `dropout` | 0.1 | Dropout rate |
 | `batch_size` | 4-32 | Depends on GPU memory and protein length |
 | `k_neighbors` | 48 | Number of neighbors in graph (keep same as pretrained) |
+| `lora_rank` | 4-16 | Rank of LoRA matrices (lower = more constrained) |
+| `freeze_encoder_layers` | 0-3 | Number of encoder layers to freeze |
+| `ewc_lambda` | 1000-5000 | EWC regularization strength |
 
 ## Monitoring Training
 
@@ -271,6 +390,13 @@ python finetune_proteinmpnn.py \
     --use_wandb \
     --wandb_project my_project
 ```
+
+### Additional Metrics with EWC
+
+When using EWC, additional metrics are logged:
+- `train/task_loss`: Task-specific loss
+- `train/ewc_loss`: EWC penalty
+- `train/total_loss`: Combined loss
 
 ## Output Files
 
@@ -326,6 +452,24 @@ python sample_sequences.py \
     --num_samples 100
 ```
 
+## Troubleshooting
+
+### If accuracy is too low:
+1. Reduce LoRA rank constraint (r=4 → r=8 → r=16)
+2. Reduce number of frozen layers
+3. Reduce EWC lambda (λ=2000 → λ=1000 → λ=500)
+4. Increase learning rate slightly
+
+### If weights deviate too much from pretrained:
+1. Use LoRA with lower rank (r=4-8)
+2. Freeze more layers (2-3 encoder layers)
+3. Increase EWC lambda (λ=1000 → λ=2000 → λ=5000)
+4. Decrease learning rate (1e-4 → 1e-5)
+
+### If training is too slow:
+1. Use LoRA instead of EWC (no Fisher computation needed)
+2. Reduce `ewc_sample_size` (200 → 100)
+3. Use layer freezing (fastest option)
 
 ## Citation
 

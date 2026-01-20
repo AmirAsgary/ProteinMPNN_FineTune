@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
+
 """
-ProteinMPNN Fine-tuning Script (Corrected Version)
+ProteinMPNN Fine-tuning Script with LoRA, Layer Freezing, and EWC Support
 
-This version exactly matches the original ProteinMPNN architecture to ensure
-compatibility with pretrained weights.
+This version adds three optional features to prevent catastrophic forgetting:
+1. LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning
+2. Layer freezing to preserve pretrained representations
+3. Elastic Weight Consolidation (EWC) to protect important weights
 
-Usage:
-    # Training
-    python finetune_proteinmpnn.py \
-        --data_dir ./my_pdbs \
-        --checkpoint ./pretrained/v_48_020.pt \
-        --output_dir ./finetuned_model \
-        --epochs 50 \
-        --lr 1e-4
-
-    # Testing
-    python finetune_proteinmpnn.py \
-        --test \
-        --test_data_dir ./test_pdbs \
-        --checkpoint ./finetuned_model/checkpoints/checkpoint_best.pt \
-        --output_dir ./test_results
+New arguments:
+--use_lora: Enable LoRA adapters
+--lora_rank: Rank for LoRA matrices (default: 8)
+--lora_alpha: LoRA scaling parameter (default: 16)
+--freeze_encoder_layers: Number of encoder layers to freeze from the start (default: 0)
+--freeze_decoder_layers: Number of decoder layers to freeze from the start (default: 0)
+--use_ewc: Enable Elastic Weight Consolidation
+--ewc_lambda: EWC regularization strength (default: 1000)
+--ewc_sample_size: Number of samples for Fisher computation (default: 200)
 """
 
 import os
@@ -32,7 +29,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -65,6 +61,149 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+# ==============================================================================
+# LORA IMPLEMENTATION
+# ==============================================================================
+
+class LoRALayer(nn.Module):
+    """
+    LoRA (Low-Rank Adaptation) layer
+    Adds trainable low-rank matrices A and B to a frozen linear layer
+    """
+    def __init__(self, original_layer, rank=8, alpha=16):
+        super().__init__()
+        self.original_layer = original_layer
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        in_features = original_layer.in_features
+        out_features = original_layer.out_features
+
+        # LoRA matrices
+        self.lora_A = nn.Parameter(torch.zeros(in_features, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, out_features))
+
+        # Initialize A with Kaiming uniform, B with zeros
+        nn.init.kaiming_uniform_(self.lora_A, a=np.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+        # Freeze original layer
+        for param in self.original_layer.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        # Original layer output + LoRA adaptation
+        result = self.original_layer(x)
+        lora_out = (x @ self.lora_A @ self.lora_B) * self.scaling
+        return result + lora_out
+
+
+def add_lora_to_linear(module, rank=8, alpha=16, target_modules=None):
+    """
+    Recursively add LoRA to linear layers in a module
+
+    Args:
+        module: The module to modify
+        rank: Rank of LoRA matrices
+        alpha: LoRA scaling parameter
+        target_modules: List of module name patterns to target (e.g., ['W1', 'W2', 'W3'])
+    """
+    if target_modules is None:
+        target_modules = ['W1', 'W2', 'W3', 'W11', 'W12', 'W13', 'W_in', 'W_out']
+
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear) and any(target in name for target in target_modules):
+            # Replace with LoRA version
+            lora_layer = LoRALayer(child, rank=rank, alpha=alpha)
+            setattr(module, name, lora_layer)
+        else:
+            # Recurse
+            add_lora_to_linear(child, rank, alpha, target_modules)
+
+
+def count_lora_parameters(model):
+    """Count trainable LoRA parameters"""
+    lora_params = sum(p.numel() for n, p in model.named_parameters() 
+                     if p.requires_grad and ('lora_A' in n or 'lora_B' in n))
+    total_params = sum(p.numel() for p in model.parameters())
+    return lora_params, total_params
+
+# ==============================================================================
+# EWC IMPLEMENTATION
+# ==============================================================================
+
+class EWC:
+    """
+    Elastic Weight Consolidation
+    Computes Fisher Information Matrix and adds regularization to preserve important weights
+    """
+    def __init__(self, model, dataset, device, sample_size=200):
+        self.model = model
+        self.device = device
+        self.params = {n: p.clone().detach() for n, p in model.named_parameters() if p.requires_grad}
+        self.fisher = self._compute_fisher(dataset, sample_size)
+
+    def _compute_fisher(self, dataset, sample_size):
+        """Compute Fisher Information Matrix using sampled data"""
+        print(f"Computing Fisher Information Matrix on {sample_size} samples...")
+        fisher = {n: torch.zeros_like(p) for n, p in self.model.named_parameters() if p.requires_grad}
+
+        self.model.eval()
+
+        # Sample indices
+        indices = np.random.choice(len(dataset), min(sample_size, len(dataset)), replace=False)
+
+        for idx in indices:
+            self.model.zero_grad()
+
+            # Get a single sample
+            sample = dataset[idx]
+
+            # Create batch of size 1
+            batch = {
+                'X': sample['X'].unsqueeze(0).to(self.device),
+                'S': sample['S'].unsqueeze(0).to(self.device),
+                'mask': sample['mask'].unsqueeze(0).to(self.device),
+                'chain_M': sample['chain_M'].unsqueeze(0).to(self.device),
+                'residue_idx': sample['residue_idx'].unsqueeze(0).to(self.device),
+                'chain_encoding_all': sample['chain_encoding_all'].unsqueeze(0).to(self.device)
+            }
+
+            randn = torch.randn(1, batch['X'].shape[1], device=self.device)
+
+            # Forward pass
+            log_probs = self.model(
+                batch['X'], batch['S'], batch['mask'], batch['chain_M'],
+                batch['residue_idx'], batch['chain_encoding_all'], randn
+            )
+
+            # Compute loss
+            loss_mask = batch['chain_M'] * batch['mask']
+            _, loss = loss_nll(batch['S'], log_probs, loss_mask)
+
+            # Backward to get gradients
+            loss.backward()
+
+            # Accumulate squared gradients (Fisher = E[grad^2])
+            for n, p in self.model.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    fisher[n] += p.grad.detach() ** 2
+
+        # Normalize by sample size
+        for n in fisher:
+            fisher[n] /= sample_size
+
+        print("Fisher Information Matrix computed successfully!")
+        return fisher
+
+    def penalty(self, model):
+        """Compute EWC penalty term"""
+        loss = 0
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.fisher:
+                loss += (self.fisher[n] * (p - self.params[n]) ** 2).sum()
+        return loss
 
 # ==============================================================================
 # LOGGING
@@ -75,7 +214,7 @@ def setup_logging(output_dir: str) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"training_{timestamp}.log"
-    
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -85,7 +224,6 @@ def setup_logging(output_dir: str) -> logging.Logger:
         ]
     )
     return logging.getLogger(__name__)
-
 
 # ==============================================================================
 # MODEL COMPONENTS - EXACT MATCH TO ORIGINAL PROTEINMPNN
@@ -680,6 +818,7 @@ def collate_fn(batch):
     }
 
 
+
 # ==============================================================================
 # TRAINING
 # ==============================================================================
@@ -694,7 +833,6 @@ def loss_nll(S, log_probs, mask):
     loss_av = torch.sum(loss * mask) / torch.sum(mask)
     return loss, loss_av
 
-
 def loss_smoothed(S, log_probs, mask, weight=0.1):
     """Label smoothed loss"""
     S_onehot = F.one_hot(S, 21).float()
@@ -704,22 +842,108 @@ def loss_smoothed(S, log_probs, mask, weight=0.1):
     loss_av = torch.sum(loss * mask) / torch.sum(mask)
     return loss, loss_av
 
+def freeze_layers(model, freeze_encoder_layers=0, freeze_decoder_layers=0):
+    """
+    Freeze specified number of encoder and decoder layers
+
+    Args:
+        model: ProteinMPNN model
+        freeze_encoder_layers: Number of encoder layers to freeze (from start)
+        freeze_decoder_layers: Number of decoder layers to freeze (from start)
+    """
+    frozen_params = 0
+    total_params = 0
+
+    # Freeze encoder layers
+    if freeze_encoder_layers > 0:
+        for i in range(min(freeze_encoder_layers, len(model.encoder_layers))):
+            for param in model.encoder_layers[i].parameters():
+                param.requires_grad = False
+                frozen_params += param.numel()
+            total_params += sum(p.numel() for p in model.encoder_layers[i].parameters())
+
+    # Freeze decoder layers
+    if freeze_decoder_layers > 0:
+        for i in range(min(freeze_decoder_layers, len(model.decoder_layers))):
+            for param in model.decoder_layers[i].parameters():
+                param.requires_grad = False
+                frozen_params += param.numel()
+            total_params += sum(p.numel() for p in model.decoder_layers[i].parameters())
+
+    return frozen_params, total_params
+
+def merge_lora_weights(model):
+    """
+    Merge LoRA weights back into original weights for vanilla ProteinMPNN compatibility
+    
+    Returns:
+        merged_state_dict: State dict with LoRA merged into original weights
+    """
+    state_dict = model.state_dict()
+    merged_state = {}
+    processed_keys = set()
+    
+    print("Merging LoRA weights into original parameters...")
+    
+    # Process all keys
+    for key in state_dict.keys():
+        if 'lora_A' in key or 'lora_B' in key:
+            # Skip LoRA-specific keys
+            processed_keys.add(key)
+            continue
+        elif 'original_layer' in key:
+            # This is a frozen weight inside LoRA layer
+            new_key = key.replace('.original_layer', '')
+            merged_state[new_key] = state_dict[key].clone()
+            
+            # Check for corresponding LoRA matrices
+            base_module_key = new_key.rsplit('.', 1)[0]
+            lora_A_key = base_module_key + '.lora_A'
+            lora_B_key = base_module_key + '.lora_B'
+            
+            if lora_A_key in state_dict and lora_B_key in state_dict and 'weight' in new_key:
+                lora_A = state_dict[lora_A_key]  # [in_features, rank]
+                lora_B = state_dict[lora_B_key]  # [rank, out_features]
+                
+                rank = lora_A.shape[1]
+                alpha = 16  # Default alpha from LoRA
+                scaling = alpha / rank
+                
+                # Merge: W_new = W_original + scaling * (A @ B).T
+                # Fixed: lora_A @ lora_B, not lora_B @ lora_A
+                lora_weight = (lora_A @ lora_B).T  # [out_features, in_features]
+                merged_state[new_key] = merged_state[new_key] + scaling * lora_weight
+                
+                print(f"  ✓ Merged LoRA into: {new_key} (rank={rank})")
+            
+            processed_keys.add(key)
+        else:
+            # Regular parameter
+            merged_state[key] = state_dict[key].clone()
+            processed_keys.add(key)
+    
+    lora_param_count = sum(1 for k in state_dict if 'lora' in k)
+    print(f"Merge complete! Removed {lora_param_count} LoRA tensors")
+    return merged_state
+
+
 
 class Trainer:
-    def __init__(self, model, train_dataset, val_dataset=None, config=None, 
-                 output_dir="./outputs", device="cuda"):
+    def __init__(self, model, train_dataset, val_dataset=None, config=None,
+                 output_dir="./outputs", device="cuda", ewc=None):
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.config = config or {}
         self.output_dir = Path(output_dir)
         self.device = device
-        
+        self.ewc = ewc  # EWC object if enabled
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "checkpoints").mkdir(exist_ok=True)
-        
+
         self.logger = setup_logging(str(self.output_dir))
-        
+
         # Training params
         self.batch_size = config.get('batch_size', 8)
         self.num_epochs = config.get('num_epochs', 100)
@@ -728,14 +952,18 @@ class Trainer:
         self.grad_clip = config.get('grad_clip', 1.0)
         self.use_amp = config.get('use_amp', True) and HAS_AMP and device == "cuda"
         self.label_smoothing = config.get('label_smoothing', 0.0)
-        
+
+        # EWC params
+        self.use_ewc = config.get('use_ewc', False)
+        self.ewc_lambda = config.get('ewc_lambda', 1000.0)
+
         # Data loaders
         self.train_loader = DataLoader(
             train_dataset, batch_size=self.batch_size, shuffle=True,
             num_workers=config.get('num_workers', 4), collate_fn=collate_fn,
             pin_memory=True, drop_last=True
         )
-        
+
         if val_dataset:
             self.val_loader = DataLoader(
                 val_dataset, batch_size=self.batch_size, shuffle=False,
@@ -744,32 +972,38 @@ class Trainer:
             )
         else:
             self.val_loader = None
-            
-        # Optimizer
-        self.optimizer = AdamW(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        
+
+        # Optimizer (only optimize trainable parameters)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        self.optimizer = AdamW(trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+
+        self.logger.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+        self.logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
         # Scheduler
         total_steps = len(self.train_loader) * self.num_epochs
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=self.lr * 0.01)
-        
+
         # AMP
         self.scaler = GradScaler() if self.use_amp else None
-        
+
         # Monitoring
         self.global_step = 0
         self.best_val_loss = float('inf')
-        
+
         if HAS_TENSORBOARD:
             self.writer = SummaryWriter(log_dir=str(self.output_dir / "tensorboard"))
         else:
             self.writer = None
-            
+
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
+        total_ewc_loss = 0
+        total_task_loss = 0
         total_tokens = 0
         total_correct = 0
-        
+
         for batch_idx, batch in enumerate(self.train_loader):
             X = batch['X'].to(self.device)
             S = batch['S'].to(self.device)
@@ -777,21 +1011,28 @@ class Trainer:
             chain_M = batch['chain_M'].to(self.device)
             residue_idx = batch['residue_idx'].to(self.device)
             chain_encoding = batch['chain_encoding_all'].to(self.device)
-            
             randn = torch.randn(X.shape[0], X.shape[1], device=self.device)
-            
+
             self.optimizer.zero_grad()
-            
+
             if self.use_amp:
                 with autocast():
                     log_probs = self.model(X, S, mask, chain_M, residue_idx, chain_encoding, randn)
-                    
                     loss_mask = chain_M * mask
+
                     if self.label_smoothing > 0:
-                        _, loss = loss_smoothed(S, log_probs, loss_mask, self.label_smoothing)
+                        _, task_loss = loss_smoothed(S, log_probs, loss_mask, self.label_smoothing)
                     else:
-                        _, loss = loss_nll(S, log_probs, loss_mask)
-                        
+                        _, task_loss = loss_nll(S, log_probs, loss_mask)
+
+                    # Add EWC penalty if enabled
+                    if self.use_ewc and self.ewc is not None:
+                        ewc_loss = self.ewc.penalty(self.model)
+                        loss = task_loss + self.ewc_lambda * ewc_loss
+                    else:
+                        loss = task_loss
+                        ewc_loss = torch.tensor(0.0)
+
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -799,19 +1040,27 @@ class Trainer:
                 self.scaler.update()
             else:
                 log_probs = self.model(X, S, mask, chain_M, residue_idx, chain_encoding, randn)
-                
                 loss_mask = chain_M * mask
+
                 if self.label_smoothing > 0:
-                    _, loss = loss_smoothed(S, log_probs, loss_mask, self.label_smoothing)
+                    _, task_loss = loss_smoothed(S, log_probs, loss_mask, self.label_smoothing)
                 else:
-                    _, loss = loss_nll(S, log_probs, loss_mask)
-                    
+                    _, task_loss = loss_nll(S, log_probs, loss_mask)
+
+                # Add EWC penalty if enabled
+                if self.use_ewc and self.ewc is not None:
+                    ewc_loss = self.ewc.penalty(self.model)
+                    loss = task_loss + self.ewc_lambda * ewc_loss
+                else:
+                    loss = task_loss
+                    ewc_loss = torch.tensor(0.0)
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
-                
+
             self.scheduler.step()
-            
+
             # Metrics
             with torch.no_grad():
                 predictions = log_probs.argmax(dim=-1)
@@ -819,30 +1068,42 @@ class Trainer:
                 total_correct += correct
                 total_tokens += loss_mask.sum().item()
                 total_loss += loss.item() * loss_mask.sum().item()
-                
+                total_task_loss += task_loss.item() * loss_mask.sum().item()
+                if isinstance(ewc_loss, torch.Tensor):
+                    total_ewc_loss += ewc_loss.item() * loss_mask.sum().item()
+
             self.global_step += 1
-            
+
             if self.global_step % self.config.get('log_interval', 10) == 0:
                 if self.writer:
                     self.writer.add_scalar('train/loss', loss.item(), self.global_step)
+                    self.writer.add_scalar('train/task_loss', task_loss.item(), self.global_step)
+                    if isinstance(ewc_loss, torch.Tensor) and ewc_loss.item() > 0:
+                        self.writer.add_scalar('train/ewc_loss', ewc_loss.item(), self.global_step)
                     self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
-                    
-        return {
+
+        metrics = {
             'loss': total_loss / max(total_tokens, 1),
+            'task_loss': total_task_loss / max(total_tokens, 1),
             'accuracy': total_correct / max(total_tokens, 1),
-            'perplexity': np.exp(total_loss / max(total_tokens, 1))
+            'perplexity': np.exp(total_task_loss / max(total_tokens, 1))
         }
-        
+
+        if self.use_ewc:
+            metrics['ewc_loss'] = total_ewc_loss / max(total_tokens, 1)
+
+        return metrics
+
     @torch.no_grad()
     def evaluate(self):
         if not self.val_loader:
             return {}
-            
+
         self.model.eval()
         total_loss = 0
         total_tokens = 0
         total_correct = 0
-        
+
         for batch in self.val_loader:
             X = batch['X'].to(self.device)
             S = batch['S'].to(self.device)
@@ -850,28 +1111,31 @@ class Trainer:
             chain_M = batch['chain_M'].to(self.device)
             residue_idx = batch['residue_idx'].to(self.device)
             chain_encoding = batch['chain_encoding_all'].to(self.device)
-            
             randn = torch.randn(X.shape[0], X.shape[1], device=self.device)
-            
+
             log_probs = self.model(X, S, mask, chain_M, residue_idx, chain_encoding, randn)
-            
             loss_mask = chain_M * mask
             _, loss = loss_nll(S, log_probs, loss_mask)
-            
+
             predictions = log_probs.argmax(dim=-1)
             correct = ((predictions == S) * loss_mask).sum().item()
-            
+
             total_loss += loss.item() * loss_mask.sum().item()
             total_tokens += loss_mask.sum().item()
             total_correct += correct
-            
+
         return {
             'loss': total_loss / max(total_tokens, 1),
             'accuracy': total_correct / max(total_tokens, 1),
             'perplexity': np.exp(total_loss / max(total_tokens, 1))
         }
-        
+
     def save_checkpoint(self, epoch, metrics=None, is_best=False):
+        # Check if model has LoRA
+        has_lora = any('lora_A' in name or 'lora_B' in name 
+                    for name, _ in self.model.named_parameters())
+        
+        # Save regular checkpoint (with LoRA if present)
         checkpoint = {
             'epoch': epoch,
             'global_step': self.global_step,
@@ -880,19 +1144,42 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'config': self.config,
             'metrics': metrics,
-            'num_edges': self.config.get('k_neighbors', 48)
+            'num_edges': self.config.get('k_neighbors', 48),
+            'has_lora': has_lora
         }
         
+        # Save epoch checkpoint
         torch.save(checkpoint, self.output_dir / "checkpoints" / f"checkpoint_epoch_{epoch}.pt")
         torch.save(checkpoint, self.output_dir / "checkpoints" / "checkpoint_latest.pt")
         
         if is_best:
             torch.save(checkpoint, self.output_dir / "checkpoints" / "checkpoint_best.pt")
             self.logger.info(f"New best model saved (val_loss={metrics.get('val_loss', 'N/A'):.4f})")
+        
+        # If using LoRA, also save merged version
+        if has_lora:
+            self.logger.info("Creating merged checkpoint (vanilla ProteinMPNN compatible)...")
+            merged_state = merge_lora_weights(self.model)
             
+            checkpoint_merged = checkpoint.copy()
+            checkpoint_merged['model_state_dict'] = merged_state
+            checkpoint_merged['has_lora'] = False
+            
+            # Save merged versions
+            torch.save(checkpoint_merged, 
+                    self.output_dir / "checkpoints" / f"checkpoint_epoch_{epoch}_merged.pt")
+            torch.save(checkpoint_merged, 
+                    self.output_dir / "checkpoints" / "checkpoint_latest_merged.pt")
+            
+            if is_best:
+                torch.save(checkpoint_merged, 
+                        self.output_dir / "checkpoints" / "checkpoint_best_merged.pt")
+                self.logger.info("✓ Saved checkpoint_best_merged.pt (use this for vanilla ProteinMPNN)")
+
+
     def train(self, resume_from=None):
         start_epoch = 0
-        
+
         if resume_from:
             ckpt = torch.load(resume_from, map_location=self.device)
             self.model.load_state_dict(ckpt['model_state_dict'])
@@ -902,39 +1189,45 @@ class Trainer:
             start_epoch = ckpt.get('epoch', 0) + 1
             self.global_step = ckpt.get('global_step', 0)
             self.logger.info(f"Resumed from epoch {start_epoch}")
-            
+
         self.logger.info(f"Starting training for {self.num_epochs} epochs")
         self.logger.info(f"Train: {len(self.train_dataset)}, Val: {len(self.val_dataset) if self.val_dataset else 0}")
-        
+
+        if self.use_ewc:
+            self.logger.info(f"EWC enabled with lambda={self.ewc_lambda}")
+
         for epoch in range(start_epoch, self.num_epochs):
             train_metrics = self.train_epoch(epoch)
-            self.logger.info(f"Epoch {epoch} - Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
-            
+
+            log_msg = f"Epoch {epoch} - Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}"
+            if 'ewc_loss' in train_metrics:
+                log_msg += f", EWC: {train_metrics['ewc_loss']:.4f}"
+            self.logger.info(log_msg)
+
             if self.val_loader and (epoch + 1) % self.config.get('eval_interval', 1) == 0:
                 val_metrics = self.evaluate()
                 self.logger.info(f"Epoch {epoch} - Val Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f}")
-                
+
                 if self.writer:
                     self.writer.add_scalar('val/loss', val_metrics['loss'], epoch)
                     self.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
-                    
+
                 is_best = val_metrics['loss'] < self.best_val_loss
                 if is_best:
                     self.best_val_loss = val_metrics['loss']
             else:
                 val_metrics = {}
                 is_best = False
-                
+
             if (epoch + 1) % self.config.get('save_interval', 5) == 0:
                 metrics = {'train_loss': train_metrics['loss']}
                 if val_metrics:
                     metrics['val_loss'] = val_metrics['loss']
                 self.save_checkpoint(epoch, metrics, is_best)
-                
+
         self.logger.info("Training complete!")
         if self.writer:
             self.writer.close()
-
 
 # ==============================================================================
 # TESTING
@@ -1079,6 +1372,7 @@ def run_test(model, test_dataset, config, output_dir, device):
     return results_summary
 
 
+
 # ==============================================================================
 # MAIN
 # ==============================================================================
@@ -1087,30 +1381,30 @@ def load_pretrained_weights(model, checkpoint_path, strict=False):
     """Load pretrained ProteinMPNN weights"""
     print(f"Loading weights from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    
+
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
     else:
         state_dict = checkpoint
-        
+
     missing, unexpected = model.load_state_dict(state_dict, strict=strict)
-    
+
     if missing:
         print(f"Missing keys: {len(missing)}")
         for k in missing[:5]:
             print(f"  {k}")
+
     if unexpected:
         print(f"Unexpected keys: {len(unexpected)}")
         for k in unexpected[:5]:
             print(f"  {k}")
-            
+
     print("Weights loaded successfully!")
     return checkpoint
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune or Test ProteinMPNN")
-    
+    parser = argparse.ArgumentParser(description="Fine-tune or Test ProteinMPNN with LoRA, Layer Freezing, and EWC")
+
     # Data arguments
     parser.add_argument("--data_dir", type=str, default=None,
                         help="Training data directory (required unless --test is used)")
@@ -1126,7 +1420,7 @@ def main():
                         help="Pretrained checkpoint path (required for --test)")
     parser.add_argument("--output_dir", type=str, default="./outputs",
                         help="Output directory for results/checkpoints")
-    
+
     # Model arguments
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_encoder_layers", type=int, default=3)
@@ -1135,7 +1429,7 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--backbone_noise", type=float, default=0.0,
                         help="Noise added to backbone coordinates (disabled during test)")
-    
+
     # Training arguments
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
@@ -1143,7 +1437,31 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--label_smoothing", type=float, default=0.0)
-    
+
+    # LoRA arguments
+    parser.add_argument("--use_lora", action="store_true",
+                        help="Enable LoRA (Low-Rank Adaptation)")
+    parser.add_argument("--lora_rank", type=int, default=8,
+                        help="Rank for LoRA matrices")
+    parser.add_argument("--lora_alpha", type=int, default=16,
+                        help="LoRA scaling parameter (alpha)")
+    parser.add_argument("--lora_target_modules", type=str, default="W1,W2,W3,W11,W12,W13,W_in,W_out",
+                        help="Comma-separated list of module names to apply LoRA to")
+
+    # Layer freezing arguments
+    parser.add_argument("--freeze_encoder_layers", type=int, default=0,
+                        help="Number of encoder layers to freeze from the start")
+    parser.add_argument("--freeze_decoder_layers", type=int, default=0,
+                        help="Number of decoder layers to freeze from the start")
+
+    # EWC arguments
+    parser.add_argument("--use_ewc", action="store_true",
+                        help="Enable Elastic Weight Consolidation")
+    parser.add_argument("--ewc_lambda", type=float, default=1000.0,
+                        help="EWC regularization strength")
+    parser.add_argument("--ewc_sample_size", type=int, default=200,
+                        help="Number of samples for Fisher Information Matrix computation")
+
     # Other arguments
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=1)
@@ -1152,9 +1470,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume training from checkpoint")
-    
+
     args = parser.parse_args()
-    
+
     # Validate arguments
     if args.test:
         if not args.test_data_dir:
@@ -1164,28 +1482,28 @@ def main():
     else:
         if not args.data_dir:
             parser.error("--data_dir is required for training")
-    
+
     # Set seed
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-        
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    
+
     # Load fixed positions config
     fixed_chains, fixed_positions = {}, {}
     if args.fixed_positions_json:
         with open(args.fixed_positions_json) as f:
             config = json.load(f)
-        for name, settings in config.items():
-            if 'fixed_chains' in settings:
-                fixed_chains[name] = settings['fixed_chains']
-            if 'fixed_positions' in settings:
-                fixed_positions[name] = settings['fixed_positions']
-    
+            for name, settings in config.items():
+                if 'fixed_chains' in settings:
+                    fixed_chains[name] = settings['fixed_chains']
+                if 'fixed_positions' in settings:
+                    fixed_positions[name] = settings['fixed_positions']
+
     # Model
     model = ProteinMPNN(
         num_letters=21,
@@ -1195,58 +1513,88 @@ def main():
         num_encoder_layers=args.num_encoder_layers,
         num_decoder_layers=args.num_decoder_layers,
         k_neighbors=args.k_neighbors,
-        augment_eps=0.0 if args.test else args.backbone_noise,  # No noise during test
-        dropout=args.dropout if not args.test else 0.0  # No dropout during test
+        augment_eps=0.0 if args.test else args.backbone_noise,
+        dropout=args.dropout if not args.test else 0.0
     )
-    
+
     # Load checkpoint
     if args.checkpoint:
         load_pretrained_weights(model, args.checkpoint, strict=False)
-        
+
+    # Apply LoRA if enabled
+    if args.use_lora and not args.test:
+        print("\n" + "="*60)
+        print("APPLYING LORA")
+        print("="*60)
+        target_modules = args.lora_target_modules.split(',')
+        add_lora_to_linear(model, rank=args.lora_rank, alpha=args.lora_alpha, 
+                          target_modules=target_modules)
+        lora_params, total_params = count_lora_parameters(model)
+        print(f"LoRA parameters: {lora_params:,} ({lora_params/total_params*100:.2f}% of total)")
+        print(f"LoRA rank: {args.lora_rank}, alpha: {args.lora_alpha}")
+        print("="*60 + "\n")
+
+    # Freeze layers if specified
+    if (args.freeze_encoder_layers > 0 or args.freeze_decoder_layers > 0) and not args.test:
+        print("\n" + "="*60)
+        print("FREEZING LAYERS")
+        print("="*60)
+        frozen_params, layer_params = freeze_layers(
+            model, 
+            freeze_encoder_layers=args.freeze_encoder_layers,
+            freeze_decoder_layers=args.freeze_decoder_layers
+        )
+        print(f"Frozen encoder layers: {args.freeze_encoder_layers}/{args.num_encoder_layers}")
+        print(f"Frozen decoder layers: {args.freeze_decoder_layers}/{args.num_decoder_layers}")
+        print(f"Frozen parameters: {frozen_params:,}")
+        print("="*60 + "\n")
+
     model = model.to(device)
-    
+
     num_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {num_params:,}")
-    
+    print(f"Trainable parameters: {trainable_params:,} ({trainable_params/num_params*100:.2f}%)")
+
     # Config for data loading
     config = {
         'batch_size': args.batch_size,
         'num_workers': args.num_workers,
         'k_neighbors': args.k_neighbors,
     }
-    
+
     if args.test:
         # ===================== TEST MODE =====================
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print("RUNNING IN TEST MODE")
-        print("=" * 60 + "\n")
-        
+        print("="*60 + "\n")
+
         test_dataset = ProteinDataset(
             args.test_data_dir,
             fixed_chains_dict=fixed_chains,
             fixed_positions_dict=fixed_positions
         )
-        
+
         results = run_test(model, test_dataset, config, args.output_dir, device)
-        
-        print("\n" + "=" * 60)
+
+        print("\n" + "="*60)
         print("TEST COMPLETE")
         print(f"Results saved to: {args.output_dir}")
-        print("=" * 60)
-        
+        print("="*60)
+
     else:
         # ===================== TRAINING MODE =====================
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print("RUNNING IN TRAINING MODE")
-        print("=" * 60 + "\n")
-        
+        print("="*60 + "\n")
+
         # Datasets
         train_dataset = ProteinDataset(
             args.data_dir,
             fixed_chains_dict=fixed_chains,
             fixed_positions_dict=fixed_positions
         )
-        
+
         val_dataset = None
         if args.val_data_dir:
             val_dataset = ProteinDataset(
@@ -1254,7 +1602,17 @@ def main():
                 fixed_chains_dict=fixed_chains,
                 fixed_positions_dict=fixed_positions
             )
-        
+
+        # Initialize EWC if enabled
+        ewc = None
+        if args.use_ewc:
+            print("\n" + "="*60)
+            print("INITIALIZING EWC")
+            print("="*60)
+            ewc = EWC(model, train_dataset, device, sample_size=args.ewc_sample_size)
+            print(f"EWC lambda: {args.ewc_lambda}")
+            print("="*60 + "\n")
+
         # Training config
         config.update({
             'num_epochs': args.epochs,
@@ -1265,12 +1623,13 @@ def main():
             'log_interval': args.log_interval,
             'eval_interval': args.eval_interval,
             'save_interval': args.save_interval,
-            'use_amp': True
+            'use_amp': True,
+            'use_ewc': args.use_ewc,
+            'ewc_lambda': args.ewc_lambda
         })
-        
-        trainer = Trainer(model, train_dataset, val_dataset, config, args.output_dir, device)
-        trainer.train(resume_from=args.resume)
 
+        trainer = Trainer(model, train_dataset, val_dataset, config, args.output_dir, device, ewc=ewc)
+        trainer.train(resume_from=args.resume)
 
 if __name__ == "__main__":
     main()
